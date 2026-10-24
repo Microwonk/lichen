@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright © 2026 AerynOS Developers
+#
+# SPDX-License-Identifier: MPL-2.0
+#
+# run lichen inside a throwaway QEMU VM
+#
+# the VM boots the AerynOS live ISO with a pre-partitioned scratch disk. the
+# scratch disk is a CoW overlay over a base image, so every run can start
+# from the same state. the `target` dir is shared read-only into the guest,
+# so that rebuilding binaries do not require rebuilding the VM
+
+set -euo pipefail
+
+ISO_VERSION="${LICHEN_VM_ISO_VERSION:-2026.08}"
+ISO_NAME="AerynOS-${ISO_VERSION}-GNOME-live-x86_64.iso"
+ISO_URL="${LICHEN_VM_ISO_URL:-https://cdn.aerynos.dev/isos/${ISO_NAME}}"
+
+VM_DIR="${LICHEN_VM_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lichen-vm}"
+VM_MEM="${LICHEN_VM_MEM:-4G}"
+VM_CPUS="${LICHEN_VM_CPUS:-4}"
+VM_DISPLAY="${LICHEN_VM_DISPLAY:-gtk}"
+DISK_SIZE="${LICHEN_VM_DISK_SIZE:-40G}"
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+
+ISO="$VM_DIR/$ISO_NAME"
+LIVE_DIR="$VM_DIR/live-$ISO_VERSION"
+BASE_DISK="$VM_DIR/target-base.raw"
+DISK="$VM_DIR/target.qcow2"
+VARS="$VM_DIR/OVMF_VARS.fd"
+
+GUID_ESP="C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+GUID_XBOOTLDR="BC13C2FF-59E6-4262-A352-B275FD6F7172"
+GUID_LINUX="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+
+die() {
+    echo "lichen-vm: $*" >&2
+    exit 1
+}
+
+need_command() {
+    local cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
+    done
+}
+
+find_ovmf() {
+    local code vars
+    # loop common OVMF_CODE locations among distros, as they're not the same
+    for code in \
+        "${LICHEN_VM_OVMF_CODE:-}" \
+        /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        /usr/share/edk2/ovmf/OVMF_CODE.fd \
+        /usr/share/OVMF/OVMF_CODE_4M.fd \
+        /usr/share/OVMF/OVMF_CODE.fd; do
+        [[ -n "$code" && -f "$code" ]] || continue
+        vars="${LICHEN_VM_OVMF_VARS:-${code/CODE/VARS}}"
+        [[ -f "$vars" ]] || continue
+        OVMF_CODE="$code"
+        OVMF_VARS_TEMPLATE="$vars"
+        return 0
+    done
+    die "OVMF firmware not found, install edk2-ovmf or set LICHEN_VM_OVMF_CODE/LICHEN_VM_OVMF_VARS"
+}
+
+cmd_fetch() {
+    need_command curl sha256sum bsdtar mcopy mtype
+    mkdir -p "$VM_DIR"
+    if [[ ! -f "$ISO" ]]; then
+        echo "Downloading $ISO_URL"
+        curl -fL --retry 3 -C - -o "$ISO.part" "$ISO_URL"
+        mv "$ISO.part" "$ISO"
+    fi
+    echo "Verifying $ISO_NAME"
+    local sum
+    sum="$(curl -fsSL "$ISO_URL.sha256sum" | awk '{print $1}')"
+    [[ -n "$sum" ]] || die "could not fetch checksum from $ISO_URL.sha256sum"
+    echo "$sum  $ISO" | sha256sum -c --quiet || die "checksum mismatch, delete $ISO and retry"
+
+    # Extract the kernel, initrd and command line from the ISO's EFI boot
+    # image so that `--serial` can boot them directly with a serial console
+    echo "Extracting kernel and initrd"
+    rm -rf "$LIVE_DIR"
+    mkdir -p "$LIVE_DIR"
+    bsdtar -xf "$ISO" -C "$LIVE_DIR" EFI/Boot/efiboot.img
+    local efiboot="$LIVE_DIR/EFI/Boot/efiboot.img"
+    mcopy -n -i "$efiboot" ::/kernel "$LIVE_DIR/kernel"
+    mcopy -n -i "$efiboot" ::/initrd "$LIVE_DIR/initrd"
+    mtype -i "$efiboot" ::/loader/entries/live-os.conf |
+        sed -n 's/^options[[:space:]]\+//p' >"$LIVE_DIR/cmdline"
+    rm -rf "$LIVE_DIR/EFI"
+    [[ -s "$LIVE_DIR/cmdline" ]] || die "could not read the live kernel command line from the ISO"
+}
+
+# partition start and size (in 512-byte sectors) of the given 1-based number
+partition_geometry() {
+    sfdisk --dump "$1" | awk -v want="$1$2" -F'[ ,=]+' '
+        $1 == want { for (i = 2; i < NF; i++) { if ($i == "start") s = $(i+1); if ($i == "size") n = $(i+1) } }
+        END { if (s == "" || n == "") exit 1; print s, n }'
+}
+
+# create a filesystem inside a partition of a disk image without needing loop
+# devices or root by building it in a scratch file and copying it into place
+mkfs_partition() {
+    local image="$1" num="$2" start size scratch
+    shift 2
+    read -r start size < <(partition_geometry "$image" "$num")
+    scratch="$(mktemp "$VM_DIR/part.XXXXXX")"
+    truncate -s $((size * 512)) "$scratch"
+    "$@" "$scratch" >/dev/null
+    dd if="$scratch" of="$image" bs=4M conv=notrunc,sparse oflag=seek_bytes seek=$((start * 512)) status=none
+    rm -f "$scratch"
+}
+
+cmd_prepare() {
+    local blank=0
+    if [[ "${1:-}" == "--blank" ]]; then
+        blank=1
+    fi
+
+    need_command sfdisk mkfs.fat mkfs.xfs qemu-img
+    mkdir -p "$VM_DIR"
+    rm -f "$BASE_DISK" "$DISK" "$VARS"
+
+    truncate -s "$DISK_SIZE" "$BASE_DISK"
+    if ((blank)); then
+        # no partition table, to let the installer partition from scratch
+        echo "Creating blank $DISK_SIZE base disk"
+        chmod a-w "$BASE_DISK"
+        cmd_reset
+        return
+    fi
+
+    echo "Creating $DISK_SIZE base disk with ESP, XBOOTLDR and root partitions"
+    sfdisk --quiet "$BASE_DISK" <<EOF
+label: gpt
+size=512MiB, type=$GUID_ESP, name="ESP"
+size=4GiB, type=$GUID_XBOOTLDR, name="XBOOTLDR"
+type=$GUID_LINUX, name="root"
+EOF
+    mkfs_partition "$BASE_DISK" 1 mkfs.fat -F 32 -n ESP
+    mkfs_partition "$BASE_DISK" 2 mkfs.fat -F 32 -n XBOOTLDR
+    # lichen needs a recognizable superblock on the root partition at probe
+    # time, even though it reformats the partition during installation.
+    mkfs_partition "$BASE_DISK" 3 mkfs.xfs -q -f -L root
+    # keep the base image pristine by writing only to the overlay
+    chmod a-w "$BASE_DISK"
+
+    cmd_reset
+}
+
+cmd_reset() {
+    need_command qemu-img
+    [[ -f "$BASE_DISK" ]] || die "no base disk, run '$0 prepare' first"
+    find_ovmf
+    rm -f "$DISK" "$VARS"
+    qemu-img create -q -f qcow2 -b "$BASE_DISK" -F raw "$DISK"
+    cp "$OVMF_VARS_TEMPLATE" "$VARS"
+    chmod u+w "$VARS"
+    echo "Target disk reset to pristine state"
+}
+
+run_qemu() {
+    need_command qemu-system-x86_64
+    find_ovmf
+    [[ -f "$DISK" && -f "$VARS" ]] || die "no target disk, run '$0 prepare' first"
+
+    local accel=()
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+        accel=(-accel kvm -cpu host)
+    else
+        echo "lichen-vm: /dev/kvm not usable, falling back to slow emulation" >&2
+        accel=(-accel tcg)
+    fi
+
+    mkdir -p "$REPO_DIR/target"
+    exec qemu-system-x86_64 \
+        -name lichen-vm \
+        -machine q35 \
+        "${accel[@]}" \
+        -smp "$VM_CPUS" \
+        -m "$VM_MEM" \
+        -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,unit=1,file=$VARS" \
+        -drive "if=none,id=target,format=qcow2,file=$DISK,discard=unmap" \
+        -device "virtio-blk-pci,drive=target,serial=lichen-target,bootindex=1" \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
+        -device virtio-rng-pci \
+        -virtfs "local,path=$REPO_DIR/target,mount_tag=lichen,security_model=none,readonly=on" \
+        "$@"
+}
+
+cmd_live() {
+    [[ -f "$ISO" && -s "$LIVE_DIR/cmdline" ]] || die "no live ISO, run '$0 fetch' first"
+
+    local serial=0
+    if [[ "${1:-}" == "--serial" ]]; then
+        serial=1
+        shift
+    fi
+
+    cat <<EOF
+Booting the live ISO with the scratch target disk attached.
+
+Inside the guest, mount the host's target/ directory via 9p:
+
+    sudo mkdir -p /mnt/lichen
+    sudo mount -t 9p -o trans=virtio,version=9p2000.L lichen /mnt/lichen
+    sudo /mnt/lichen/debug/lichen_cli
+
+EOF
+
+    local live=(
+        -drive "if=none,id=live,media=cdrom,readonly=on,file=$ISO"
+        -device "ide-cd,drive=live$( ((serial)) || echo ",bootindex=0")"
+    )
+
+    if ((serial)); then
+        # boot the ISO's kernel directly so the console can be redirected to
+        # the terminal and skip the desktop
+        local cmdline
+        cmdline="$(tr ' ' '\n' <"$LIVE_DIR/cmdline" | grep -vE '^(quiet|splash|plymouth\..*)$' | paste -sd' ')"
+        cat <<EOF
+Log in as 'live' or 'root' without a password. Quit with Ctrl-a x
+
+EOF
+        run_qemu "${live[@]}" \
+            -kernel "$LIVE_DIR/kernel" \
+            -initrd "$LIVE_DIR/initrd" \
+            -append "$cmdline console=tty0 console=ttyS0,115200 systemd.unit=multi-user.target" \
+            -display none \
+            -serial mon:stdio \
+            "$@"
+    else
+        run_qemu "${live[@]}" \
+            -device virtio-vga \
+            -display "$VM_DISPLAY" \
+            "$@"
+    fi
+}
+
+cmd_installed() {
+    echo "Booting the installed system from the scratch target disk"
+    run_qemu -device virtio-vga -display "$VM_DISPLAY" "$@"
+}
+
+cmd_clean() {
+    rm -f "$BASE_DISK" "$DISK" "$VARS"
+    echo "Removed disk images"
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 <command> [options] [extra qemu args...]
+
+Commands:
+  fetch             Download the AerynOS live ISO
+  prepare [--blank] Create the pre-partitioned base disk and overlay.
+                    --blank does not create a partition table on the disk
+  reset             Discard all changes made to the target disk
+  live [--serial]   Boot the live ISO with the target disk attached.
+                    --serial runs headless with the tty forwarded to
+                    the QEMU serial port into the terminal
+  installed         Boot the system that lichen installed on the target disk
+  clean             Remove disk images (not the ISO)
+
+Environment:
+  LICHEN_VM_DIR          state directory (default: $VM_DIR)
+  LICHEN_VM_ISO_VERSION  live ISO release (default: $ISO_VERSION)
+  LICHEN_VM_MEM          guest memory (default: $VM_MEM)
+  LICHEN_VM_CPUS         guest CPUs (default: $VM_CPUS)
+  LICHEN_VM_DISK_SIZE    target disk size used by 'prepare' (default: $DISK_SIZE)
+  LICHEN_VM_DISPLAY      qemu display backend (default: $VM_DISPLAY)
+EOF
+}
+
+case "${1:-}" in
+    fetch | prepare | reset | live | installed | clean)
+        cmd="$1"
+        shift
+        "cmd_$cmd" "$@"
+        ;;
+    -h | --help | help | "") usage ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac
